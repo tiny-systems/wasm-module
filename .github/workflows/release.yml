@@ -12,11 +12,20 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '>=1.23.1'
-      - run: |
+      - name: Build and publish
+        env:
+          MODULE_NAME: ${{ github.event.repository.name }}
+          MODULE_VERSION: ${{ github.ref_name }}
+          MODULE_FULL: github.com/${{ github.repository }}
+          DEV_KEY: ${{ secrets.TINY_DEV_SECRET }}
+        run: |
           echo "Preparing a release"
-          echo "Module name ${{ github.event.repository.name }}"
+          echo "Module name: $MODULE_NAME"
+          # Strip any local replace directives — only used during local dev.
+          sed -i '/replace github.com\/tiny-systems\/module =>/d' go.mod
           go mod tidy
-          go run cmd/main.go tools build --version ${{github.ref_name}} --name github.com/${{ github.repository }} --devkey ${{secrets.TINY_DEV_SECRET}}
+          go test ./...
+          go run cmd/main.go tools build --version "$MODULE_VERSION" --name "$MODULE_FULL" --devkey "$DEV_KEY"
 
       - name: Notify e2e
         if: success()
