@@ -10,6 +10,13 @@
 // SDK reflector publishes InputData / OutputData shapes on the
 // Request/Response ports so downstream edges validate without
 // scenarios.
+//
+// Two operational signals on top of that:
+//   - phase state guards Handle so requests during compile fail loudly
+//     instead of silently returning an empty response or stalling
+//   - optional Status output port emits one event per state transition
+//     (compiling / ready / error) so flow authors can observe lifecycle
+//     in real time without polling
 package eval
 
 import (
@@ -19,6 +26,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
+	"time"
 
 	"github.com/goccy/go-json"
 	"github.com/tetratelabs/wazero"
@@ -33,8 +42,14 @@ const (
 	RequestPort   = "request"
 	ResponsePort  = "response"
 	ErrorPort     = "error"
+	StatusPort    = "status"
 
 	LangTinyGo = "tinygo"
+
+	PhaseUninitialized = ""
+	PhaseCompiling     = "compiling"
+	PhaseReady         = "ready"
+	PhaseError         = "error"
 )
 
 // Context, InputData, OutputData are type aliases for `any` to enable
@@ -54,10 +69,11 @@ type Source struct {
 }
 
 type Settings struct {
-	EnableErrorPort bool       `json:"enableErrorPort" required:"true" title:"Enable Error Port" description:"If error happens at runtime, error port will emit an error message" tab:"Settings"`
-	InputData       InputData  `json:"inputData" configurable:"true" title:"Input shape" description:"Schema and example of expected input (what your program reads from stdin)." tab:"Settings"`
-	OutputData      OutputData `json:"outputData" configurable:"true" title:"Output shape" description:"Schema and example of program output (what your program writes to stdout)." tab:"Settings"`
-	Source          Source     `json:"source" required:"true" title:"Source" tab:"Source"`
+	EnableErrorPort  bool       `json:"enableErrorPort" required:"true" title:"Enable Error Port" description:"If runtime errors happen, route them to the Error port instead of failing the request." tab:"Settings"`
+	EnableStatusPort bool       `json:"enableStatusPort" required:"true" title:"Enable Status Port" description:"Emit lifecycle events (compiling / ready / error) on a status output port. Useful for observing long-running compiles." tab:"Settings"`
+	InputData        InputData  `json:"inputData" configurable:"true" title:"Input shape" description:"Schema and example of expected input (what your program reads from stdin)." tab:"Settings"`
+	OutputData       OutputData `json:"outputData" configurable:"true" title:"Output shape" description:"Schema and example of program output (what your program writes to stdout)." tab:"Settings"`
+	Source           Source     `json:"source" required:"true" title:"Source" tab:"Source"`
 }
 
 type Request struct {
@@ -75,13 +91,33 @@ type Error struct {
 	Error   string  `json:"error"`
 }
 
+// Status is the payload on the optional Status output port. Emitted on
+// every phase transition: compiling → ready, or compiling → error. Apps
+// can route this port to a debug node, an alerting flow, or wherever
+// they want the lifecycle signal.
+type Status struct {
+	Phase     string `json:"phase" title:"Phase" description:"compiling | ready | error"`
+	Message   string `json:"message,omitempty" title:"Message" description:"Free-form detail. For 'error' phase, holds the compile failure text."`
+	ElapsedMs int64  `json:"elapsedMs,omitempty" title:"Elapsed (ms)" description:"Wall time since the current phase started"`
+}
+
 // Component holds the wazero runtime + compiled module. The source is
 // compiled once on Settings change; per-request work is just module
 // instantiation (microseconds with wazero) and WASI execution.
+//
+// phase guards concurrency: Handle reads it under RLock to decide
+// whether to run, fail-with-error, or wait. OnSettings writes it
+// under Lock when transitioning between compile / ready / error.
 type Component struct {
-	settings Settings
-	runtime  wazero.Runtime
-	compiled wazero.CompiledModule
+	module.Base
+
+	mu        sync.RWMutex
+	settings  Settings
+	runtime   wazero.Runtime
+	compiled  wazero.CompiledModule
+	phase     string
+	phaseMsg  string
+	phaseTime time.Time
 }
 
 func (c *Component) Instance() module.Component {
@@ -94,10 +130,12 @@ func (c *Component) GetInfo() module.ComponentInfo {
 		Description: "WASM Eval",
 		Info: "Compile and run a user-supplied program as WebAssembly per incoming request. " +
 			"Write source in Settings.Source.Content (TinyGo for now — read JSON from os.Stdin, " +
-			"write JSON to os.Stdout). Declare Settings.inputData (your stdin shape) and " +
-			"Settings.outputData (your stdout shape) so edges validate without scenarios. " +
-			"Compile errors surface in node status; runtime errors route to the Error port when enabled. " +
-			"Context passes through untouched — your program does not see it.",
+			"write JSON to os.Stdout). Declare Settings.inputData and Settings.outputData so " +
+			"edges validate without scenarios. Compile errors surface in node status; runtime " +
+			"errors route to the Error port when enabled. Enable Settings.EnableStatusPort to " +
+			"emit lifecycle events on the Status port — useful because cold compiles can run " +
+			"into minutes and you want to know the node isn't dead. Context passes through " +
+			"untouched; the wasm module does not see it.",
 		Tags: []string{"wasm", "wasi", "tinygo", "eval", "engine"},
 	}
 }
@@ -105,24 +143,59 @@ func (c *Component) GetInfo() module.ComponentInfo {
 // OnSettings compiles the user's source into wasm via the bundled
 // toolchain, then stores the resulting module for per-request
 // execution. Compile failures are returned as errors so the SDK
-// reports them through TinyNode.Status, where read_project / the UI
-// can read them back.
+// reports them through TinyNode.Status. When EnableStatusPort is set,
+// the component also emits explicit start / ready / error events on
+// the Status port so live observers don't have to poll node status.
 func (c *Component) OnSettings(ctx context.Context, msg any) error {
 	in, ok := msg.(Settings)
 	if !ok {
 		return fmt.Errorf("invalid settings")
 	}
+
+	c.mu.Lock()
 	c.settings = in
+	c.mu.Unlock()
 
 	if in.Source.Content == "" {
+		c.setPhase(ctx, PhaseUninitialized, "no source provided")
 		return nil
 	}
 
+	start := time.Now()
+	c.setPhase(ctx, PhaseCompiling, "compiling "+in.Source.Language+" source")
+
 	wasmBytes, err := compileSource(ctx, in.Source.Language, in.Source.Content)
 	if err != nil {
+		c.setPhase(ctx, PhaseError, err.Error())
 		return fmt.Errorf("compile %s: %w", in.Source.Language, err)
 	}
-	return c.loadWasm(ctx, wasmBytes)
+	if err := c.loadWasm(ctx, wasmBytes); err != nil {
+		c.setPhase(ctx, PhaseError, err.Error())
+		return err
+	}
+	c.setPhase(ctx, PhaseReady, fmt.Sprintf("compiled in %s", time.Since(start).Round(time.Millisecond)))
+	return nil
+}
+
+// setPhase records the new phase and emits a Status event when the
+// status port is enabled. Holds the write lock so phase reads from
+// Handle stay consistent with the wasm runtime state set alongside it.
+func (c *Component) setPhase(ctx context.Context, phase, message string) {
+	c.mu.Lock()
+	c.phase = phase
+	c.phaseMsg = message
+	c.phaseTime = time.Now()
+	enabled := c.settings.EnableStatusPort
+	c.mu.Unlock()
+
+	if !enabled || phase == "" {
+		return
+	}
+	_ = c.Emit(ctx, StatusPort, Status{
+		Phase:     phase,
+		Message:   message,
+		ElapsedMs: 0,
+	})
 }
 
 // compileSource shells out to the language's toolchain to produce a
@@ -187,11 +260,14 @@ func (c *Component) loadWasm(ctx context.Context, wasmBytes []byte) error {
 		_ = rt.Close(ctx)
 		return fmt.Errorf("compile wasm: %w", err)
 	}
-	if c.runtime != nil {
-		_ = c.runtime.Close(context.Background())
-	}
+	c.mu.Lock()
+	prior := c.runtime
 	c.runtime = rt
 	c.compiled = compiled
+	c.mu.Unlock()
+	if prior != nil {
+		_ = prior.Close(context.Background())
+	}
 	return nil
 }
 
@@ -203,8 +279,27 @@ func (c *Component) Handle(ctx context.Context, handler module.Handler, port str
 	if !ok {
 		return module.Fail(fmt.Errorf("invalid input"))
 	}
-	if c.compiled == nil {
+
+	// Snapshot phase + compiled module under read lock so we don't race
+	// with OnSettings swapping the runtime mid-handle.
+	c.mu.RLock()
+	phase := c.phase
+	phaseMsg := c.phaseMsg
+	phaseTime := c.phaseTime
+	c.mu.RUnlock()
+
+	// Refuse the request loudly when there's nothing usable to run.
+	// This guards against "silently returns empty" while a long compile
+	// is in flight — callers see the actual state instead of waiting
+	// on an unresponsive handler.
+	switch phase {
+	case PhaseUninitialized:
 		return c.handleError(ctx, handler, in.Context, fmt.Errorf("no compiled module — provide Settings.Source.Content"))
+	case PhaseCompiling:
+		elapsed := time.Since(phaseTime).Round(time.Second)
+		return c.handleError(ctx, handler, in.Context, fmt.Errorf("still compiling (%s elapsed): %s", elapsed, phaseMsg))
+	case PhaseError:
+		return c.handleError(ctx, handler, in.Context, fmt.Errorf("last compile failed: %s", phaseMsg))
 	}
 
 	out, err := c.run(ctx, in.InputData)
@@ -223,6 +318,14 @@ func (c *Component) Handle(ctx context.Context, handler module.Handler, port str
 // State is fresh per request so modules can't accidentally leak data
 // across invocations.
 func (c *Component) run(ctx context.Context, input InputData) (OutputData, error) {
+	c.mu.RLock()
+	compiled := c.compiled
+	runtime := c.runtime
+	c.mu.RUnlock()
+	if compiled == nil || runtime == nil {
+		return nil, fmt.Errorf("no compiled module")
+	}
+
 	inputJSON, err := json.Marshal(input)
 	if err != nil {
 		return nil, fmt.Errorf("marshal input: %w", err)
@@ -238,7 +341,7 @@ func (c *Component) run(ctx context.Context, input InputData) (OutputData, error
 		WithStderr(stderr).
 		WithArgs("wasm_eval")
 
-	instance, err := c.runtime.InstantiateModule(ctx, c.compiled, cfg)
+	instance, err := runtime.InstantiateModule(ctx, compiled, cfg)
 	if err != nil {
 		if stderr.Len() > 0 {
 			return nil, fmt.Errorf("wasm exited: %w (stderr: %s)", err, stderr.String())
@@ -292,16 +395,25 @@ func (c *Component) Ports() []module.Port {
 			Configuration: c.settings,
 		},
 	}
-	if !c.settings.EnableErrorPort {
-		return ports
+	if c.settings.EnableErrorPort {
+		ports = append(ports, module.Port{
+			Position:      module.Bottom,
+			Name:          ErrorPort,
+			Label:         "Error",
+			Source:        true,
+			Configuration: Error{},
+		})
 	}
-	return append(ports, module.Port{
-		Position:      module.Bottom,
-		Name:          ErrorPort,
-		Label:         "Error",
-		Source:        true,
-		Configuration: Error{},
-	})
+	if c.settings.EnableStatusPort {
+		ports = append(ports, module.Port{
+			Position:      module.Bottom,
+			Name:          StatusPort,
+			Label:         "Status",
+			Source:        true,
+			Configuration: Status{},
+		})
+	}
+	return ports
 }
 
 var (
