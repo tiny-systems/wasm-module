@@ -6,7 +6,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	_ "github.com/tiny-systems/example-module/components/echo"
+	_ "github.com/tiny-systems/wasm-module-v0/components/eval"
 	"github.com/tiny-systems/module/cli"
 	"os"
 	"os/signal"
@@ -16,7 +16,7 @@ import (
 // RootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
 	Use:   "server",
-	Short: "tiny-system's example module",
+	Short: "Tiny Systems WASM module — run user-supplied WebAssembly modules per request via wazero + WASI",
 	Run: func(cmd *cobra.Command, args []string) {
 		cmd.Help()
 	},

@@ -1,70 +1,118 @@
-# Tiny Systems Example Module
+# Tiny Systems WASM Module
 
-Template repository for building your own Tiny Systems module. Fork this repo to get started.
+Run user-supplied WebAssembly modules as flow components. The WASM runtime
+is [wazero](https://wazero.io) — pure Go, no CGO. Authors compile any
+language to `wasm32-wasi` (TinyGo, Rust, AssemblyScript, Zig) and drop
+the resulting `.wasm` binary into a `wasm_eval` node's settings.
 
-## What's Included
+## Components
 
-A minimal Echo component that receives a message and passes it through:
+### `wasm_eval`
 
-```go
-func (t *Component) Handle(ctx context.Context, handler module.Handler, port string, msg interface{}) any {
-    if in, ok := msg.(InMessage); ok {
-        return handler(ctx, OutPort, in.Context)
-    }
-    return fmt.Errorf("invalid message")
+Executes a WASI command module per incoming request, using stdin/stdout
+as the JSON IO boundary. Mirrors the shape of `js_eval` from
+`js-module-v0` — author declares the input shape, output shape, and the
+module binary in settings; downstream edges get validated against the
+declared output shape with no scenarios required.
+
+**Settings**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `module` | `{name, content}` | yes | Compiled `wasm32-wasi` binary |
+| `inputData` | `configurable: any` | yes | Schema + example of what the wasm reads from stdin |
+| `outputData` | `configurable: any` | yes | Schema + example of what the wasm writes to stdout |
+| `enableErrorPort` | `bool` | yes | Route runtime failures to the Error port instead of failing |
+
+**Ports**
+
+- `request` — receives `{context, inputData}`. Edge config maps upstream data into `inputData`.
+- `response` — emits `{context, outputData}`. Context is passed through unchanged; the wasm module does not see it.
+- `error` — visible when `enableErrorPort=true`. Emits `{context, error}` for wasm failures.
+
+**ABI**
+
+The wasm module is invoked as a WASI command (the binary's `_start`
+runs to completion per request). Communication is JSON over stdin /
+stdout:
+
+```rust
+// Rust + wasm32-wasi
+use std::io::{Read, Write};
+use serde_json::Value;
+
+fn main() {
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input).unwrap();
+    let req: Value = serde_json::from_str(&input).unwrap();
+
+    let resp = serde_json::json!({
+        "greeting": format!("Hello, {}", req["name"]),
+    });
+    print!("{}", resp);
 }
 ```
 
-This demonstrates the core patterns:
-- Component interface (`GetInfo`, `Handle`, `Ports`, `Instance`)
-- Input/output ports with typed messages
-- Handler response propagation (blocking I/O)
-- `configurable:"true"` struct tag for edge data mapping
+```go
+// TinyGo + wasi
+package main
 
-## Project Structure
+import (
+    "encoding/json"
+    "os"
+)
 
+type Req struct{ Name string `json:"name"` }
+type Resp struct{ Greeting string `json:"greeting"` }
+
+func main() {
+    var r Req
+    _ = json.NewDecoder(os.Stdin).Decode(&r)
+    _ = json.NewEncoder(os.Stdout).Encode(Resp{Greeting: "Hello, " + r.Name})
+}
 ```
-cmd/main.go              # Entry point — registers components, runs CLI
-components/echo/echo.go  # Example component
-go.mod                   # SDK dependency (github.com/tiny-systems/module)
-```
 
-## Getting Started
+Build with:
+- Rust: `cargo build --target wasm32-wasi --release` → `target/wasm32-wasi/release/<crate>.wasm`
+- TinyGo: `tinygo build -o module.wasm -target=wasi main.go`
 
-1. **Use this template** — click "Use this template" on GitHub
-2. **Rename the module** in `go.mod`
-3. **Add your components** under `components/`
-4. **Register them** via `init()` + `registry.Register()`
+## Why WASM
 
-## Run Locally
+`js_eval` is great for quick JS transforms. `wasm_eval` covers the rest:
+
+- Any compiled language (Rust, Go via TinyGo, C/C++, Zig, AssemblyScript)
+- Native-speed code
+- Sandboxed by default — the wasm module sees only stdin/stdout/stderr, no host access
+- Compact, deterministic artifacts that can be versioned alongside flows
+
+## Run locally
 
 ```shell
 go run cmd/main.go run \
-  --name=my-org/my-module-v1 \
-  --namespace=tinysystems \
-  --version=1.0.0
+  --name=tinysystems/wasm-module-v0 \
+  --namespace=tinysystems-tinysystems \
+  --version=0.1.0
 ```
 
-## Build and Deploy
+## Deploy
 
 ```shell
 # Build container image
-docker build -t myregistry/my-module:1.0.0 .
-docker push myregistry/my-module:1.0.0
+docker build -t myregistry/wasm-module-v0:0.1.0 .
+docker push myregistry/wasm-module-v0:0.1.0
 
 # Install via Helm
-helm repo add tinysystems https://tiny-systems.github.io/module/
-helm install my-module tinysystems/tinysystems-operator \
-  --set controllerManager.manager.image.repository=myregistry/my-module
+helm install wasm-module tinysystems/tinysystems-operator \
+  --set controllerManager.manager.image.repository=myregistry/wasm-module-v0
 ```
 
 ## Resources
 
-- [Developer Guide](https://docs.tinysystems.io/developer-guide/getting-started/hello-world-component) — build your first component
-- [Module SDK](https://github.com/tiny-systems/module) — core library
-- [Component Examples](https://docs.tinysystems.io/examples/components/simple-transformer) — real-world patterns
+- [Tiny Systems Module SDK](https://github.com/tiny-systems/module) — core library
+- [wazero](https://wazero.io) — pure-Go WASM runtime used here
+- [WASI spec](https://wasi.dev) — the system interface authors target
 - [Tiny Systems Platform](https://tinysystems.io) — visual editor and module directory
 
 ## License
 
-This module's source code is MIT-licensed. It depends on the [Tiny Systems Module SDK](https://github.com/tiny-systems/module) (BSL 1.1). See [LICENSE](LICENSE) for details.
+MIT-licensed. Depends on the [Tiny Systems Module SDK](https://github.com/tiny-systems/module) (BSL 1.1). See [LICENSE](LICENSE) for details.
