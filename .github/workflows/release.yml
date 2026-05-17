@@ -21,8 +21,6 @@ jobs:
         run: |
           echo "Preparing a release"
           echo "Module name: $MODULE_NAME"
-          # Strip any local replace directives — only used during local dev.
-          sed -i '/replace github.com\/tiny-systems\/module =>/d' go.mod
           go mod tidy
           go test ./...
           go run cmd/main.go tools build --version "$MODULE_VERSION" --name "$MODULE_FULL" --devkey "$DEV_KEY"
