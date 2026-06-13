@@ -128,7 +128,8 @@ func (c *Component) GetInfo() module.ComponentInfo {
 	return module.ComponentInfo{
 		Name:        ComponentName,
 		Description: "WASM Eval",
-		Info: "Compile and run a user-supplied program as WebAssembly per incoming request. " +
+		Info: "Escape hatch for PRODUCED agents: run arbitrary compiled logic inline when no typed component fits, in a sandbox. Fast per-request once compiled — but a cold compile runs into minutes, so for quick interactive work prefer js_eval (no compile step). " +
+			"Compile and run a user-supplied program as WebAssembly per incoming request. " +
 			"Write source in Settings.Source.Content (TinyGo for now — read JSON from os.Stdin, " +
 			"write JSON to os.Stdout). Declare Settings.inputData and Settings.outputData so " +
 			"edges validate without scenarios. Compile errors surface in node status; runtime " +
