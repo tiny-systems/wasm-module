@@ -10,7 +10,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.20.1
 	github.com/tetratelabs/wazero v1.11.0
-	github.com/tiny-systems/module v0.13.4
+	github.com/tiny-systems/module v0.13.24
 )
 
 require (
